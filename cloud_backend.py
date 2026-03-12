@@ -466,6 +466,8 @@ class CloudWebhookHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "webhook": True, "paths": list(WEBHOOK_PATHS)}) 
 
     def do_POST(self) -> None:
+        path = self.path
+        
         if path in WEBHOOK_PATHS:
             print(f"[cloud_backend] webhook hit: {path}")
 
