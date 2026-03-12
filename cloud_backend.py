@@ -39,6 +39,128 @@ from cloudcart_config_clean import (
 
 SUPABASE_TABLE = "cloudcart_orders"
 
+WEBHOOK_PATHS = {"/cloudcart/webhook", "/webhook/order"}
+
+
+def _extract_items(payload: Dict[str, Any], attrs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+
+    source_items = attrs.get("items") or attrs.get("products") or []
+    if isinstance(source_items, list):
+        for item in source_items:
+            if not isinstance(item, dict):
+                continue
+            items.append({
+                "barcode": str(item.get("barcode") or item.get("sku") or item.get("ean") or item.get("code") or ""),
+                "name": str(item.get("name") or item.get("title") or item.get("product_name") or "Продукт"),
+                "qty": int(item.get("quantity") or item.get("qty") or item.get("ordered_quantity") or 0),
+                "picked": 0,
+            })
+
+    if items:
+        return items
+
+    included = payload.get("included", []) or []
+    if isinstance(included, list):
+        for inc in included:
+            if not isinstance(inc, dict):
+                continue
+
+            inc_type = str(inc.get("type", "")).lower()
+            if inc_type not in ("order_products", "order-product", "orderproduct", "items", "products"):
+                continue
+
+            inc_attrs = inc.get("attributes", {}) or {}
+            items.append({
+                "barcode": str(inc_attrs.get("barcode") or inc_attrs.get("sku") or inc_attrs.get("ean") or inc_attrs.get("code") or ""),
+                "name": str(inc_attrs.get("name") or inc_attrs.get("title") or inc_attrs.get("product_name") or "Продукт"),
+                "qty": int(inc_attrs.get("quantity") or inc_attrs.get("qty") or inc_attrs.get("ordered_quantity") or 0),
+                "picked": 0,
+            })
+
+    return items
+
+
+def _extract_order_record(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = payload.get("data", {}) or {}
+    attrs = data.get("attributes", {}) or {}
+
+    order_id = str(data.get("id") or attrs.get("id") or "")
+    order_number = str(attrs.get("order_number") or attrs.get("number") or order_id)
+
+    first_name = str(attrs.get("customer_first_name") or "").strip()
+    last_name = str(attrs.get("customer_last_name") or "").strip()
+    full_name = f"{first_name} {last_name}".strip()
+
+    customer_name = (
+        full_name
+        or str(attrs.get("customer_name") or "").strip()
+        or str(attrs.get("billing_name") or "").strip()
+        or str(attrs.get("shipping_name") or "").strip()
+        or "Клиент"
+    )
+
+    customer_email = str(attrs.get("customer_email") or attrs.get("email") or "")
+    status = str(attrs.get("status") or attrs.get("order_status") or "")
+
+    items = _extract_items(payload, attrs)
+
+    return {
+        "order_id": order_id,
+        "order_number": order_number,
+        "customer_name": customer_name,
+        "customer_email": customer_email,
+        "status": status,
+        "items_json": items,
+        "raw_json": payload,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def save_cloudcart_order_to_supabase(payload: Dict[str, Any]) -> Dict[str, Any]:
+    record = _extract_order_record(payload)
+
+    supabase_headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    base_url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+
+    check_resp = requests.get(
+        base_url,
+        params={
+            "select": "id",
+            "order_id": f"eq.{record['order_id']}",
+            "limit": "1",
+        },
+        headers=supabase_headers,
+        timeout=30,
+    )
+    check_resp.raise_for_status()
+    existing_rows = check_resp.json()
+
+    if existing_rows:
+        save_resp = requests.patch(
+            base_url,
+            params={"order_id": f"eq.{record['order_id']}"},
+            json=record,
+            headers=supabase_headers,
+            timeout=30,
+        )
+    else:
+        save_resp = requests.post(
+            base_url,
+            json=record,
+            headers=supabase_headers,
+            timeout=30,
+        )
+
+    save_resp.raise_for_status()
+    return record
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -340,35 +462,49 @@ class CloudWebhookHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "service": "cloud_backend"})
             return
         self._send_json(404, {"ok": False, "error": "Not found"})
+        if self.path in WEBHOOK_PATHS:
+            self._send_json(200, {"ok": True, "webhook": True, "paths": list(WEBHOOK_PATHS)}) 
 
     def do_POST(self) -> None:
-        if self.path != "/cloudcart/webhook":
-            self._send_json(404, {"ok": False, "error": "Not found"})
+        if path in WEBHOOK_PATHS:
+            print(f"[cloud_backend] webhook hit: {path}")
+
+            token = self.headers.get("X-Webhook-Token", "")
+            if token != CLOUD_BACKEND_WEBHOOK_TOKEN:
+                print("[cloud_backend] invalid webhook token")
+                self._send_json(403, {"ok": False, "error": "invalid token"})
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+                raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+
+                print(f"[cloud_backend] raw body size: {len(raw_body)}")
+
+                payload = json.loads(raw_body.decode("utf-8") or "{}")
+                record = save_cloudcart_order_to_supabase(payload)
+
+                print(
+                    f"[cloud_backend] order saved: "
+                    f"order_id={record['order_id']} "
+                    f"number={record['order_number']} "
+                    f"items={len(record['items_json'])}"
+                )
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "saved": True,
+                        "order_id": record["order_id"],
+                        "order_number": record["order_number"],
+                    },
+                )
+            except Exception as exc:
+                print(f"[cloud_backend] webhook error: {exc}")
+                self._send_json(500, {"ok": False, "error": str(exc)})
             return
 
-        expected = (CLOUD_BACKEND_WEBHOOK_TOKEN or "").strip()
-        received = self.headers.get("X-Webhook-Token", "").strip()
-        if expected and received != expected:
-            self._send_json(401, {"ok": False, "error": "Unauthorized"})
-            return
-
-        length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(length) if length > 0 else b"{}"
-
-        try:
-            payload = json.loads(raw_body.decode("utf-8"))
-            record = upsert_cloudcart_order(payload)
-            self._send_json(
-                200,
-                {
-                    "ok": True,
-                    "order_id": record["order_id"],
-                    "order_number": record["order_number"],
-                    "items": len(record["items_json"]),
-                },
-            )
-        except Exception as exc:
-            self._send_json(500, {"ok": False, "error": str(exc)})
 
     def log_message(self, format: str, *args: Any) -> None:
         print("[cloud_backend]", format % args)
