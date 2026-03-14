@@ -7,8 +7,12 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
-
 import cloudcart_config_clean as cfg
+import threading
+import os
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 8788))
+
 
 SUPABASE_URL = getattr(cfg, "SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = getattr(cfg, "SUPABASE_SERVICE_ROLE_KEY", "")
@@ -16,6 +20,8 @@ SUPABASE_PUBLISHABLE_KEY = getattr(cfg, "SUPABASE_PUBLISHABLE_KEY", "")
 CLOUD_BACKEND_HOST = getattr(cfg, "CLOUD_BACKEND_HOST", "0.0.0.0")
 CLOUD_BACKEND_PORT = int(getattr(cfg, "CLOUD_BACKEND_PORT", 8788))
 CLOUD_BACKEND_WEBHOOK_TOKEN = getattr(cfg, "CLOUD_BACKEND_WEBHOOK_TOKEN", "")
+
+port = int(os.environ.get("PORT", 8788))
 
 SUPABASE_TABLE = "cloudcart_orders"
 WEBHOOK_PATHS = {"/cloudcart/webhook", "/webhook/order"}
@@ -233,7 +239,24 @@ def save_cloudcart_order_to_supabase(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("Missing Supabase configuration")
 
+    print("[cloud_backend] save payload type:", type(payload))
+    print("[cloud_backend] save payload raw:", payload)
+
+    # normalize payload
+    if isinstance(payload, list):
+        payload = payload[0] if payload else {}
+
+    if isinstance(payload, dict) and "data" in payload:
+        if isinstance(payload["data"], list):
+            payload = payload["data"][0] if payload["data"] else {}
+        elif isinstance(payload["data"], dict):
+            payload = payload["data"]
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unsupported payload type: {type(payload)}")
+
     record = _extract_order_record(payload)
+
     if not record["order_id"]:
         raise ValueError("Missing order_id in webhook payload")
 
@@ -257,7 +280,12 @@ def save_cloudcart_order_to_supabase(payload: Dict[str, Any]) -> Dict[str, Any]:
             timeout=30,
         )
     else:
-        save_resp = requests.post(base_url, json=record, headers=_headers_write(), timeout=30)
+        save_resp = requests.post(
+            base_url,
+            json=record,
+            headers=_headers_write(),
+            timeout=30,
+        )
 
     save_resp.raise_for_status()
     return record
@@ -330,6 +358,15 @@ def fetch_cloud_order(order_id: str) -> Optional[Dict[str, Any]]:
         "raw": row,
     }
 
+def _process_webhook_payload_async(data):
+    try:
+        print("[cloud_backend] async start")
+        record = save_cloudcart_order_to_supabase(data)
+        print("[cloud_backend] ORDER SAVED:", record)
+    except Exception as exc:
+        print("[cloud_backend] ASYNC SAVE ERROR:", repr(exc))
+
+
 
 class CloudWebhookHandler(BaseHTTPRequestHandler):
     server_version = "BoomBCloudBackend/2.1"
@@ -354,17 +391,17 @@ class CloudWebhookHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        print("[cloud_backend] POST HIT")
+        print("[cloud_backend] path =", path)
+
         if path not in WEBHOOK_PATHS:
-            self._send_json(404, {"ok": False, "error": "Unknown webhook path", "path": path})
+            self._send_json(404, {"ok": False, "error": "Unknown webhook path"})
             return
 
         content_length = int(self.headers.get("Content-Length", "0") or "0")
         body = self.rfile.read(content_length) if content_length > 0 else b"{}"
         body_text = body.decode("utf-8", errors="replace")
 
-        print("=" * 70)
-        print("[cloud_backend] WEBHOOK RECEIVED")
-        print("[cloud_backend] path:", path)
         print("[cloud_backend] headers:", dict(self.headers))
         print("[cloud_backend] raw body:", body_text)
 
@@ -375,18 +412,24 @@ class CloudWebhookHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "Invalid JSON"})
             return
 
-        # CloudCart sometimes sends list instead of dict
+        # normalize top-level payload too
         if isinstance(data, list):
-            if len(data) > 0:
-                data = data[0]
+            data = data[0] if data else {}
 
-        try:
-            record = save_cloudcart_order_to_supabase(data)
-            print("[cloud_backend] ORDER SAVED:", record)
-            self._send_json(200, {"ok": True, "saved": True})
-        except Exception as exc:
-            print("[cloud_backend] SAVE ERROR:", exc)
-            self._send_json(500, {"ok": False, "error": str(exc)})
+        if isinstance(data, dict) and "data" in data:
+            if isinstance(data["data"], list):
+                data = data["data"][0] if data["data"] else {}
+            elif isinstance(data["data"], dict):
+                data = data["data"]
+
+        # return fast to CloudCart
+        self._send_json(200, {"ok": True, "received": True})
+
+        threading.Thread(
+            target=_process_webhook_payload_async,
+            args=(data,),
+            daemon=True,
+        ).start()
             
     def do_POST(self):
         print("=== WEBHOOK POST HIT ===")
@@ -398,7 +441,7 @@ class CloudWebhookHandler(BaseHTTPRequestHandler):
 
 
 def run_cloud_backend() -> None:
-    server = ThreadingHTTPServer((CLOUD_BACKEND_HOST, CLOUD_BACKEND_PORT), CloudWebhookHandler)
+    server = ThreadingHTTPServer((HOST, PORT), CloudWebhookHandler)
     print(f"Cloud backend running on http://{CLOUD_BACKEND_HOST}:{CLOUD_BACKEND_PORT}")
     print(f"Webhook paths: {', '.join(sorted(WEBHOOK_PATHS))}")
     server.serve_forever()
