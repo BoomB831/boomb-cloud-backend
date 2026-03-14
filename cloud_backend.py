@@ -395,6 +395,11 @@ class CloudWebhookHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             print("[cloud_backend] SAVE ERROR:", repr(exc))
             self._send_json(500, {"ok": False, "error": str(exc)})
+            
+    def do_POST(self):
+        print("=== WEBHOOK POST HIT ===")
+        print("PATH:", self.path)
+        print("HEADERS:", dict(self.headers))
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print("[cloud_backend]", fmt % args)
