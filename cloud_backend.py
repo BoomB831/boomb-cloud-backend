@@ -375,25 +375,17 @@ class CloudWebhookHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "Invalid JSON"})
             return
 
+        # CloudCart sometimes sends list instead of dict
+        if isinstance(data, list):
+            if len(data) > 0:
+                data = data[0]
+
         try:
             record = save_cloudcart_order_to_supabase(data)
-            print(
-                "[cloud_backend] ORDER SAVED:",
-                f"order_id={record['order_id']}",
-                f"order_number={record['order_number']}",
-                f"items={len(record['items_json'])}",
-            )
-            self._send_json(
-                200,
-                {
-                    "ok": True,
-                    "saved": True,
-                    "order_id": record["order_id"],
-                    "order_number": record["order_number"],
-                },
-            )
+            print("[cloud_backend] ORDER SAVED:", record)
+            self._send_json(200, {"ok": True, "saved": True})
         except Exception as exc:
-            print("[cloud_backend] SAVE ERROR:", repr(exc))
+            print("[cloud_backend] SAVE ERROR:", exc)
             self._send_json(500, {"ok": False, "error": str(exc)})
             
     def do_POST(self):
