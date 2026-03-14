@@ -24,7 +24,10 @@ CLOUD_BACKEND_WEBHOOK_TOKEN = getattr(cfg, "CLOUD_BACKEND_WEBHOOK_TOKEN", "")
 port = int(os.environ.get("PORT", 8788))
 
 SUPABASE_TABLE = "cloudcart_orders"
-WEBHOOK_PATHS = {"/cloudcart/webhook", "/webhook/order"}
+WEBHOOK_PATHS = {
+    "/cloudcart/webhook",
+    "/webhook"
+}
 
 
 def _now_iso() -> str:
